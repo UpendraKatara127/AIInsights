@@ -23,6 +23,20 @@ def _format_date(d: dt.date) -> str:
     return d.isoformat()
 
 
+def _slice_frame(points: List[Point], *, lookback_days: int, end_offset_days: int) -> tuple[str | None, List[Point]]:
+    if lookback_days <= 0:
+        raise ValueError("lookback_days must be > 0")
+    if end_offset_days < 0:
+        raise ValueError("end_offset_days must be >= 0")
+    if not points:
+        return None, []
+
+    t0 = _parse_date(max(p.date for p in points))
+    t = t0 - dt.timedelta(days=end_offset_days)
+    window = [p for p in points if _parse_date(p.date) <= t][-lookback_days:]
+    return _format_date(t), window
+
+
 @dataclass
 class DataStore:
     system_series: Dict[str, List[Point]]
@@ -99,8 +113,7 @@ class DataStore:
         points = self.system_series.get(system_id, [])
         if not points:
             return {"system_id": system_id, "t": None, "values": []}
-        t = max(p.date for p in points)
-        window = [p for p in points if p.date <= t][-lookback_days:]
+        t, window = _slice_frame(points, lookback_days=lookback_days, end_offset_days=0)
         return {
             "system_id": system_id,
             "t": t,
@@ -111,8 +124,28 @@ class DataStore:
         points = self.device_series.get((system_id, device_id), [])
         if not points:
             return {"system_id": system_id, "device_id": device_id, "t": None, "values": []}
-        t = max(p.date for p in points)
-        window = [p for p in points if p.date <= t][-lookback_days:]
+        t, window = _slice_frame(points, lookback_days=lookback_days, end_offset_days=0)
+        return {
+            "system_id": system_id,
+            "device_id": device_id,
+            "t": t,
+            "values": [{"date": p.date, "v": p.v} for p in window],
+        }
+
+    def fetch_system_timeseries_frame(self, system_id: str, lookback_days: int, end_offset_days: int) -> Dict:
+        points = self.system_series.get(system_id, [])
+        t, window = _slice_frame(points, lookback_days=int(lookback_days), end_offset_days=int(end_offset_days))
+        return {
+            "system_id": system_id,
+            "t": t,
+            "values": [{"date": p.date, "v": p.v} for p in window],
+        }
+
+    def fetch_device_timeseries_frame(
+        self, system_id: str, device_id: str, lookback_days: int, end_offset_days: int
+    ) -> Dict:
+        points = self.device_series.get((system_id, device_id), [])
+        t, window = _slice_frame(points, lookback_days=int(lookback_days), end_offset_days=int(end_offset_days))
         return {
             "system_id": system_id,
             "device_id": device_id,

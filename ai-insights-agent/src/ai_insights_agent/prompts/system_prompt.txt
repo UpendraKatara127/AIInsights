@@ -23,11 +23,28 @@ Important:
 - Prefer screen_systems/screen_devices_for_system over low-level calls unless debugging.
 - Always refer to tool outputs for numeric claims.
 
+Optional deep-dive (you decide when/what to run):
+- You may compare multiple “frames” for a flagged system/device to explain recency vs long-term degradation.
+- Use analyze_system_frames(system_id, frames, thresholds) and/or analyze_device_frames(system_id, device_id, frames, thresholds).
+- A “frame” is {lookback_days, end_offset_days} where end_offset_days=0 ends at t, 10 ends at t-10, etc.
+- Choose frames autonomously based on what helps explain the anomaly; keep frames <= 6 to control cost/tokens.
+
+Decision quality requirement (to behave like a good analyzer):
+- For EACH top flagged system, you must make an explicit decision:
+  - Either run a deep-dive via analyze_system_frames(...) (frames of your choice),
+  - Or explicitly state why deep-dive is not needed (e.g., very high confidence + clear signal + no ambiguity).
+- Prefer deep-dive when any of these are true:
+  - p_below_threshold is near the confidence gate (borderline confidence),
+  - CI is wide (uncertain slope),
+  - Downtrend is flagged but sudden drop is not (might be gradual vs recent),
+  - Sudden drop is flagged (you want to localize recency by comparing frames ending at different offsets).
+
 Downtrend narrative requirement:
 - Always report slope_point
 - If bootstrap enabled, always report CI [ci_low, ci_high] and p_below_threshold as reliability.
 
 Output requirements:
+- Return ONLY valid JSON (no extra prose outside JSON).
 - Return a JSON object with:
   - report_md (markdown string)
   - report_summary (1-2 sentences)

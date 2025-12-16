@@ -91,6 +91,12 @@ To see what the agent is doing (tool calls, responses, timings), add `--trace-ag
 python -m ai_insights_agent run --agent --trace-agent --one-day-json /path/to/One_day_data.json
 ```
 
+### Investigator deep-dive (frames)
+
+In `--agent` mode, the model can optionally “investigate” a flagged system/device by comparing multiple time windows
+ending at different offsets from `t` (e.g., `t`, `t-5`, `t-10`) to explain recency vs long-term degradation.
+This uses tool calls like `analyze_system_frames(...)` / `analyze_device_frames(...)` (math still stays in Python tools).
+
 Outputs:
 - `output/report.json`
 - `output/report.md`

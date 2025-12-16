@@ -60,10 +60,14 @@ class AIInsightsAgent:
             {
                 "list_system_ids": self._tool_list_system_ids,
                 "fetch_system_timeseries": self._tool_fetch_system_timeseries,
+                "fetch_system_timeseries_frame": self._tool_fetch_system_timeseries_frame,
+                "analyze_system_frames": self._tool_analyze_system_frames,
                 "flag_series": self._tool_flag_series,
                 "rank_systems": self._tool_rank_systems,
                 "list_devices": self._tool_list_devices,
                 "fetch_device_timeseries": self._tool_fetch_device_timeseries,
+                "fetch_device_timeseries_frame": self._tool_fetch_device_timeseries_frame,
+                "analyze_device_frames": self._tool_analyze_device_frames,
                 "rank_devices": self._tool_rank_devices,
                 # High-level helpers to keep the agent fast/reliable and token-efficient.
                 "screen_systems": self._tool_screen_systems,
@@ -92,6 +96,18 @@ class AIInsightsAgent:
                     "v": {"type": "number"},
                 },
                 "required": ["date", "v"],
+            },
+        }
+        frames_schema: Dict[str, Any] = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "lookback_days": {"type": "integer"},
+                    "end_offset_days": {"type": "integer", "description": "0 ends at t; 10 ends at t-10"},
+                },
+                "required": ["lookback_days", "end_offset_days"],
             },
         }
         return [
@@ -130,6 +146,20 @@ class AIInsightsAgent:
             },
             {
                 "type": "function",
+                "name": "fetch_system_timeseries_frame",
+                "description": "Fetch a window ending at t-end_offset_days (frame analysis).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "system_id": {"type": "string"},
+                        "lookback_days": {"type": "integer"},
+                        "end_offset_days": {"type": "integer"},
+                    },
+                    "required": ["system_id", "lookback_days", "end_offset_days"],
+                },
+            },
+            {
+                "type": "function",
                 "name": "flag_series",
                 "description": "Compute DOCX indicators + bootstrap downtrend confidence; returns JSON flags",
                 "parameters": {
@@ -139,6 +169,20 @@ class AIInsightsAgent:
                         "thresholds": {"type": "object", "additionalProperties": True},
                     },
                     "required": ["values"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "analyze_system_frames",
+                "description": "Compute flags across multiple frames for a system (investigation).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "system_id": {"type": "string"},
+                        "frames": frames_schema,
+                        "thresholds": {"type": "object", "additionalProperties": True},
+                    },
+                    "required": ["system_id", "frames", "thresholds"],
                 },
             },
             {
@@ -195,6 +239,21 @@ class AIInsightsAgent:
             },
             {
                 "type": "function",
+                "name": "fetch_device_timeseries_frame",
+                "description": "Fetch a device window ending at t-end_offset_days (frame analysis).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "system_id": {"type": "string"},
+                        "device_id": {"type": "string"},
+                        "lookback_days": {"type": "integer"},
+                        "end_offset_days": {"type": "integer"},
+                    },
+                    "required": ["system_id", "device_id", "lookback_days", "end_offset_days"],
+                },
+            },
+            {
+                "type": "function",
                 "name": "rank_devices",
                 "description": "Rank device results by severity + tie-break rules",
                 "parameters": {
@@ -204,6 +263,21 @@ class AIInsightsAgent:
                         "top_k": {"type": "integer"},
                     },
                     "required": ["top_k"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "analyze_device_frames",
+                "description": "Compute flags across multiple frames for a device (investigation).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "system_id": {"type": "string"},
+                        "device_id": {"type": "string"},
+                        "frames": frames_schema,
+                        "thresholds": {"type": "object", "additionalProperties": True},
+                    },
+                    "required": ["system_id", "device_id", "frames", "thresholds"],
                 },
             },
         ]
@@ -439,6 +513,15 @@ class AIInsightsAgent:
         self._log(f"[tool] fetch_system_timeseries system_id={system_id} n={len(ts.get('values', []))}")
         return ts
 
+    def _tool_fetch_system_timeseries_frame(
+        self, system_id: str, lookback_days: int, end_offset_days: int
+    ) -> Dict[str, Any]:
+        ts = self.datastore.fetch_system_timeseries_frame(system_id, int(lookback_days), int(end_offset_days))
+        self._log(
+            f"[tool] fetch_system_timeseries_frame system_id={system_id} lookback_days={lookback_days} end_offset_days={end_offset_days} n={len(ts.get('values', []))}"
+        )
+        return ts
+
     def _tool_fetch_device_timeseries(self, system_id: str, device_id: str, lookback_days: int) -> Dict[str, Any]:
         ts = self.datastore.fetch_device_timeseries(system_id, device_id, int(lookback_days))
         self._pending_device_fetches.append(ts)
@@ -446,6 +529,125 @@ class AIInsightsAgent:
             f"[tool] fetch_device_timeseries system_id={system_id} device_id={device_id} n={len(ts.get('values', []))}"
         )
         return ts
+
+    def _tool_fetch_device_timeseries_frame(
+        self, system_id: str, device_id: str, lookback_days: int, end_offset_days: int
+    ) -> Dict[str, Any]:
+        ts = self.datastore.fetch_device_timeseries_frame(
+            system_id, device_id, int(lookback_days), int(end_offset_days)
+        )
+        self._log(
+            f"[tool] fetch_device_timeseries_frame system_id={system_id} device_id={device_id} lookback_days={lookback_days} end_offset_days={end_offset_days} n={len(ts.get('values', []))}"
+        )
+        return ts
+
+    def _tool_analyze_system_frames(
+        self, system_id: str, frames: List[Dict[str, Any]], thresholds: Dict[str, Any] | None = None
+    ) -> Dict[str, Any]:
+        thr = thresholds if thresholds is not None else self._runtime_thresholds
+
+        def summarize(values: List[Dict[str, Any]]) -> Dict[str, Any]:
+            if not values:
+                return {"n": 0}
+            vs = [float(p["v"]) for p in values]
+            n = len(vs)
+            mean = sum(vs) / n
+            var = sum((x - mean) ** 2 for x in vs) / n
+            std = var ** 0.5
+            first = vs[0]
+            last = vs[-1]
+            delta = last - first
+            pct = (delta / first * 100.0) if first not in (0.0, -0.0) else None
+            return {
+                "n": n,
+                "first": first,
+                "last": last,
+                "delta": delta,
+                "pct_change": pct,
+                "min": min(vs),
+                "max": max(vs),
+                "mean": mean,
+                "std": std,
+            }
+
+        out_frames: List[Dict[str, Any]] = []
+        for f in frames:
+            lb = int(f["lookback_days"])
+            off = int(f["end_offset_days"])
+            ts = self.datastore.fetch_system_timeseries_frame(system_id, lb, off)
+            values = ts.get("values", []) or []
+            flags = flag_series(values, thr)
+            out_frames.append(
+                {
+                    "frame": {"lookback_days": lb, "end_offset_days": off},
+                    "t": ts.get("t"),
+                    "range": {
+                        "start": values[0]["date"] if values else None,
+                        "end": values[-1]["date"] if values else None,
+                    },
+                    "summary": summarize(values),
+                    "flags": flags,
+                }
+            )
+
+        self._log(f"[tool] analyze_system_frames system_id={system_id} frames={len(out_frames)}")
+        return {"system_id": system_id, "frames": out_frames}
+
+    def _tool_analyze_device_frames(
+        self,
+        system_id: str,
+        device_id: str,
+        frames: List[Dict[str, Any]],
+        thresholds: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        thr = thresholds if thresholds is not None else self._runtime_thresholds
+
+        def summarize(values: List[Dict[str, Any]]) -> Dict[str, Any]:
+            if not values:
+                return {"n": 0}
+            vs = [float(p["v"]) for p in values]
+            n = len(vs)
+            mean = sum(vs) / n
+            var = sum((x - mean) ** 2 for x in vs) / n
+            std = var ** 0.5
+            first = vs[0]
+            last = vs[-1]
+            delta = last - first
+            pct = (delta / first * 100.0) if first not in (0.0, -0.0) else None
+            return {
+                "n": n,
+                "first": first,
+                "last": last,
+                "delta": delta,
+                "pct_change": pct,
+                "min": min(vs),
+                "max": max(vs),
+                "mean": mean,
+                "std": std,
+            }
+
+        out_frames: List[Dict[str, Any]] = []
+        for f in frames:
+            lb = int(f["lookback_days"])
+            off = int(f["end_offset_days"])
+            ts = self.datastore.fetch_device_timeseries_frame(system_id, device_id, lb, off)
+            values = ts.get("values", []) or []
+            flags = flag_series(values, thr)
+            out_frames.append(
+                {
+                    "frame": {"lookback_days": lb, "end_offset_days": off},
+                    "t": ts.get("t"),
+                    "range": {
+                        "start": values[0]["date"] if values else None,
+                        "end": values[-1]["date"] if values else None,
+                    },
+                    "summary": summarize(values),
+                    "flags": flags,
+                }
+            )
+
+        self._log(f"[tool] analyze_device_frames system_id={system_id} device_id={device_id} frames={len(out_frames)}")
+        return {"system_id": system_id, "device_id": device_id, "frames": out_frames}
 
     def _tool_flag_series(
         self,
