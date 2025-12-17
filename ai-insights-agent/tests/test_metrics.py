@@ -11,7 +11,6 @@ from ai_insights_agent.config import BootstrapConfig, Thresholds
 
 
 def test_slope_formula_matches_doc():
-    # y = [1,2,3,4] has positive slope
     y = [1.0, 2.0, 3.0, 4.0]
     slope = linear_regression_slope(y)
     assert abs(slope - 1.0) < 1e-9
@@ -19,7 +18,6 @@ def test_slope_formula_matches_doc():
 
 def test_sudden_drop_percentile_floor_index():
     t = Thresholds(sudden_drop_percentile=10, minimum_sudden_drop_amount=2.5)
-    # n=10 => floor(10*10/100)=1 => 2nd element after sort
     y = [100, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     out = sudden_drop_indicator([float(v) for v in y], thresholds=t)
     assert out["percentile_value"] == 2.0
@@ -41,7 +39,6 @@ def test_bootstrap_downtrend_confidence_gate():
     assert out["bootstrap"]["enabled"] is True
     assert out["bootstrap"]["p_below_threshold"] >= 0.8
     assert out["flag"] is True
-    # CI should typically contain the point estimate in non-pathological cases.
     ci_low = out["bootstrap"]["ci_low"]
     ci_high = out["bootstrap"]["ci_high"]
     assert ci_low <= out["slope_point"] <= ci_high

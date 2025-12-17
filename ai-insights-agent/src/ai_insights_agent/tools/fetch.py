@@ -11,7 +11,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 @dataclass(frozen=True)
 class Point:
-    date: str  # YYYY-MM-DD
+    date: str
     v: float
 
 
@@ -70,16 +70,6 @@ class DataStore:
 
     @staticmethod
     def from_one_day_json(one_day_json: Path, *, end_date: str | None = None) -> "DataStore":
-        """
-        Load One_day_data.json-style payload:
-          [
-            {"systemName": "System 165", "data": [..float..]},
-            ...
-          ]
-
-        Since no dates exist, synthesize YYYY-MM-DD dates ending at `end_date` (defaults to today).
-        Each index in `data` is treated as a daily entry in chronological order.
-        """
         obj = json.loads(one_day_json.read_text(encoding="utf-8"))
         if not isinstance(obj, list):
             raise ValueError("One_day_data.json must be a list of objects")
@@ -181,9 +171,9 @@ def generate_synthetic_data(
                 noise = rng.gauss(0, 0.5)
                 v = base + drift * i + noise
                 if inject and i == days - 1 and rng.random() < 0.5:
-                    v -= rng.uniform(3.0, 7.0)  # sudden drop
+                    v -= rng.uniform(3.0, 7.0)
                 if inject and rng.random() < 0.2:
-                    v += rng.gauss(0, 2.0)  # instability
+                    v += rng.gauss(0, 2.0)
                 w.writerow({"system_id": sid, "date": _format_date(d), "value": f"{v:.6f}"})
 
     if out_device:

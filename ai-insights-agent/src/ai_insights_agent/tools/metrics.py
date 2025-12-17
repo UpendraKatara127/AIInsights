@@ -79,7 +79,6 @@ def bootstrap_slope(
         sample = [pairs[rng.randrange(0, n)] for _ in range(n)]
         xs = [p[0] for p in sample]
         ys = [p[1] for p in sample]
-        # same formula with arbitrary xs
         x_mean = sum(xs) / n
         y_mean = sum(ys) / n
         numerator = 0.0
@@ -228,8 +227,30 @@ def flag_series(values: List[Dict], thresholds: Dict) -> Dict:
         downtrend_confidence_min=float(thresholds.get("downtrend_confidence_min", 0.80)),
     )
     y = _values_from_points(values)
+    if y:
+        n = len(y)
+        mean = sum(y) / n
+        var = sum((yi - mean) ** 2 for yi in y) / n
+        std = math.sqrt(var)
+        first = float(y[0])
+        last = float(y[-1])
+        delta = last - first
+        pct = (delta / first * 100.0) if first not in (0.0, -0.0) else None
+        summary = {
+            "n": int(n),
+            "first": first,
+            "last": last,
+            "delta": float(delta),
+            "pct_change": float(pct) if pct is not None else None,
+            "min": float(min(y)),
+            "max": float(max(y)),
+            "mean": float(mean),
+            "std": float(std),
+        }
+    else:
+        summary = {"n": 0}
     downward = downtrend_indicator(y, thresholds=t, bootstrap=b)
     sudden = sudden_drop_indicator(y, thresholds=t)
     unstable = unstable_indicator(y, thresholds=t)
     sev = severity_score(bool(downward["flag"]), bool(sudden["flag"]), bool(unstable["flag"]))
-    return {"downward": downward, "sudden": sudden, "unstable": unstable, "severity": sev}
+    return {"summary": summary, "downward": downward, "sudden": sudden, "unstable": unstable, "severity": sev}

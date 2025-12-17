@@ -1,5 +1,10 @@
 from __future__ import annotations
+try:
+    import truststore as _truststore
 
+    _truststore.inject_into_ssl()
+except Exception:
+    pass
 import json
 import os
 import sys
@@ -12,8 +17,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .config import Config
 from .tools.fetch import DataStore
-from .tools.metrics import flag_series
+from .tools.metrics import bootstrap_slope, flag_series, linear_regression_slope
 from .tools.rank import rank_devices, rank_systems
+from .tools.sqlite_store import sql_query_readonly
+from .tools.profile import recommend_lookback
 
 
 def _load_prompt(path: Path) -> str:
@@ -35,6 +42,7 @@ class AIInsightsAgent:
         self,
         *,
         datastore: DataStore,
+        db_path: Path | None = None,
         config: Config,
         model: str,
         prompt_path: Path,
@@ -42,6 +50,7 @@ class AIInsightsAgent:
         max_log_chars: int = 2000,
     ) -> None:
         self.datastore = datastore
+        self.db_path = db_path
         self.config = config
         self.model = model
         self.system_prompt = _load_prompt(prompt_path)
@@ -55,6 +64,11 @@ class AIInsightsAgent:
         self._last_devices_system_id: str | None = None
         self._last_top_systems: List[Dict[str, Any]] = []
         self._last_top_devices_by_system: Dict[str, List[Dict[str, Any]]] = {}
+        self._system_frame_analyses: Dict[str, Dict[str, Any]] = {}
+        self._device_frame_analyses: Dict[tuple[str, str], Dict[str, Any]] = {}
+        self._population_baselines: List[Dict[str, Any]] = []
+        self._system_contexts: Dict[str, Dict[str, Any]] = {}
+        self._executed_tool_calls: List[Dict[str, Any]] = []
 
         self.registry = ToolRegistry(
             {
@@ -69,9 +83,15 @@ class AIInsightsAgent:
                 "fetch_device_timeseries_frame": self._tool_fetch_device_timeseries_frame,
                 "analyze_device_frames": self._tool_analyze_device_frames,
                 "rank_devices": self._tool_rank_devices,
-                # High-level helpers to keep the agent fast/reliable and token-efficient.
                 "screen_systems": self._tool_screen_systems,
                 "screen_devices_for_system": self._tool_screen_devices_for_system,
+                "population_baseline": self._tool_population_baseline,
+                "system_context": self._tool_system_context,
+                "sql_query": self._tool_sql_query,
+                "series_summary": self._tool_series_summary,
+                "calc_slope": self._tool_calc_slope,
+                "calc_bootstrap_slope": self._tool_calc_bootstrap_slope,
+                "recommend_lookback": self._tool_recommend_lookback,
             }
         )
 
@@ -119,6 +139,75 @@ class AIInsightsAgent:
             },
             {
                 "type": "function",
+                "name": "sql_query",
+                "description": "Run a read-only SQL query against the SQLite DB. Only SELECT/WITH are allowed. Results are capped.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sql": {"type": "string"},
+                        "params": {"type": "array", "items": {}, "description": "Positional parameters"},
+                        "named_params": {"type": "object", "additionalProperties": True},
+                        "max_rows": {"type": "integer"},
+                    },
+                    "required": ["sql"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "recommend_lookback",
+                "description": "Profile candidate lookback windows and recommend a good default for this dataset and top_k.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "top_k": {"type": "integer"},
+                        "thresholds": {"type": "object", "additionalProperties": True},
+                        "candidate_days": {"type": "array", "items": {"type": "integer"}},
+                    },
+                    "required": ["top_k"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "series_summary",
+                "description": "Compute basic summary stats for a series window (n, first/last, delta, pct_change, min/max, mean/std).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "values": series_values_schema,
+                    },
+                    "required": ["values"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "calc_slope",
+                "description": "Compute linear regression slope over y with x=1..n (per-step slope).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "values": series_values_schema,
+                    },
+                    "required": ["values"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "calc_bootstrap_slope",
+                "description": "Compute bootstrap slope distribution summary (mean/CI/p_below_threshold/p_negative) for a given threshold.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "values": series_values_schema,
+                        "threshold": {"type": "number"},
+                        "iterations": {"type": "integer"},
+                        "confidence": {"type": "number"},
+                        "seed": {"type": "integer"},
+                    },
+                    "required": ["values", "threshold"],
+                },
+            },
+            {
+                "type": "function",
                 "name": "screen_systems",
                 "description": "Compute flags for ALL systems in Python, then return ONLY the ranked top_k systems (token-efficient).",
                 "parameters": {
@@ -129,6 +218,19 @@ class AIInsightsAgent:
                         "thresholds": {"type": "object", "additionalProperties": True},
                     },
                     "required": ["lookback_days", "top_k"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "population_baseline",
+                "description": "Compute small population baselines (quantiles, flag counts) across all systems for context.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "lookback_days": {"type": "integer"},
+                        "thresholds": {"type": "object", "additionalProperties": True},
+                    },
+                    "required": ["lookback_days"],
                 },
             },
             {
@@ -183,6 +285,20 @@ class AIInsightsAgent:
                         "thresholds": {"type": "object", "additionalProperties": True},
                     },
                     "required": ["system_id", "frames", "thresholds"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "system_context",
+                "description": "Compute a system's flags plus percentile ranks vs the population for key metrics (slope, drop_amount, unstable_ratio, severity).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "system_id": {"type": "string"},
+                        "lookback_days": {"type": "integer"},
+                        "thresholds": {"type": "object", "additionalProperties": True},
+                    },
+                    "required": ["system_id", "lookback_days"],
                 },
             },
             {
@@ -313,7 +429,6 @@ class AIInsightsAgent:
             elif t == "message":
                 content = ""
                 try:
-                    # response.output_text is often the aggregated content; for trace we also print per message.
                     content = getattr(item, "content", "") or ""
                 except Exception:
                     content = ""
@@ -325,7 +440,6 @@ class AIInsightsAgent:
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is required to run the tool-calling agent")
 
-        # Lazy import so tests don't require the dependency at import time.
         from openai import OpenAI
 
         client = OpenAI(api_key=api_key)
@@ -339,7 +453,6 @@ class AIInsightsAgent:
             "bootstrap_seed": self.config.bootstrap.seed,
             "downtrend_confidence_min": self.config.bootstrap.downtrend_confidence_min,
         }
-        # Used as default tool argument if the model omits thresholds.
         self._runtime_thresholds = thresholds
 
         user_task = {
@@ -348,6 +461,16 @@ class AIInsightsAgent:
             "top_devices_per_system": self.config.ranking.top_devices_per_system,
             "thresholds": thresholds,
         }
+        if self.db_path is not None:
+            user_task["db"] = {
+                "path": str(self.db_path),
+                "read_only": True,
+                "tables": [
+                    {"name": "systems", "columns": ["system_id"]},
+                    {"name": "system_points", "columns": ["system_id", "date", "value"]},
+                    {"name": "meta", "columns": ["key", "value"]},
+                ],
+            }
 
         self._log("[agent] starting agent run")
         self._log(f"[agent] model={self.model}")
@@ -367,18 +490,16 @@ class AIInsightsAgent:
         }
 
         def openai_create(**kwargs: Any) -> Any:
-            # Simple retry loop for transient RateLimit errors.
-            from openai import RateLimitError  # type: ignore
+            from openai import RateLimitError
 
             attempts = 0
             while True:
                 attempts += 1
                 try:
                     return client.responses.create(**kwargs)
-                except RateLimitError as e:
+                except RateLimitError:
                     if attempts >= 6:
                         raise
-                    # Backoff: sleep a bit and retry.
                     time.sleep(min(2.0 ** (attempts - 1), 8.0))
 
         t0 = time.time()
@@ -413,6 +534,7 @@ class AIInsightsAgent:
                 for call in tool_calls:
                     args = json.loads(call.arguments or "{}")
                     self._log(f"[agent] executing_tool name={call.name} call_id={call.call_id}")
+                    self._executed_tool_calls.append({"name": call.name, "args": args})
                     result = self.registry.call(call.name, args)
                     self._log(f"[agent] tool_result name={call.name} bytes={len(json.dumps(result))}")
                     tool_outputs.append(
@@ -423,7 +545,6 @@ class AIInsightsAgent:
                     "model": self.model,
                     "previous_response_id": response.id,
                     "input": tool_outputs,
-                    # Tools must be provided on follow-up calls, otherwise the model can't emit function calls.
                     "tools": self._tools_schema(),
                 }
                 if supports_text:
@@ -439,10 +560,9 @@ class AIInsightsAgent:
             self._log(f"[agent] final_output_text={self._clip(text)}")
             try:
                 return json.loads(text)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 raise RuntimeError(f"Agent returned non-JSON output: {text[:500]}") from e
 
-        # Fallback for older OpenAI Python SDKs that don't expose Responses API on OpenAI().
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": "Run AI-Insights end-to-end. Input:\n" + json.dumps(user_task, indent=2)},
@@ -480,6 +600,7 @@ class AIInsightsAgent:
                 for tc in tool_calls:
                     args = json.loads(tc.function.arguments or "{}")
                     self._log(f"[agent] executing_tool name={tc.function.name} call_id={tc.id}")
+                    self._executed_tool_calls.append({"name": tc.function.name, "args": args})
                     result = self.registry.call(tc.function.name, args)
                     self._log(f"[agent] tool_result name={tc.function.name} bytes={len(json.dumps(result))}")
                     messages.append(
@@ -495,12 +616,8 @@ class AIInsightsAgent:
             self._log(f"[agent] final_output_text={self._clip(text)}")
             try:
                 return json.loads(text)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 raise RuntimeError(f"Agent returned non-JSON output: {text[:500]}") from e
-
-    # -----------------------
-    # Tool implementations
-    # -----------------------
 
     def _tool_list_system_ids(self) -> Dict[str, Any]:
         ids = self.datastore.list_system_ids()
@@ -591,7 +708,9 @@ class AIInsightsAgent:
             )
 
         self._log(f"[tool] analyze_system_frames system_id={system_id} frames={len(out_frames)}")
-        return {"system_id": system_id, "frames": out_frames}
+        result = {"system_id": system_id, "frames": out_frames}
+        self._system_frame_analyses[str(system_id)] = result
+        return result
 
     def _tool_analyze_device_frames(
         self,
@@ -647,7 +766,23 @@ class AIInsightsAgent:
             )
 
         self._log(f"[tool] analyze_device_frames system_id={system_id} device_id={device_id} frames={len(out_frames)}")
-        return {"system_id": system_id, "device_id": device_id, "frames": out_frames}
+        result = {"system_id": system_id, "device_id": device_id, "frames": out_frames}
+        self._device_frame_analyses[(str(system_id), str(device_id))] = result
+        return result
+
+    def collected_evidence(self) -> Dict[str, Any]:
+        devices_by_system: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for (sid, _did), payload in self._device_frame_analyses.items():
+            devices_by_system[sid].append(payload)
+        return {
+            "population_baselines": self._population_baselines,
+            "system_contexts": self._system_contexts,
+            "system_frames": self._system_frame_analyses,
+            "device_frames": dict(devices_by_system),
+        }
+
+    def collected_tool_calls(self) -> List[Dict[str, Any]]:
+        return list(self._executed_tool_calls)
 
     def _tool_flag_series(
         self,
@@ -723,7 +858,7 @@ class AIInsightsAgent:
             all_results.append({"system_id": system_id, "t": ts["t"], "flags": flags})
         top = rank_systems(all_results, int(top_k))["top"]
         self._last_top_systems = top
-        self._system_results = []  # avoid retaining 500 results and accidentally re-sending
+        self._system_results = []
         self._log(f"[tool] screen_systems analyzed={len(all_results)} -> top_k={top_k}")
         return {"analyzed_systems": len(all_results), "top_systems": top}
 
@@ -741,3 +876,221 @@ class AIInsightsAgent:
         self._last_top_devices_by_system[str(system_id)] = top
         self._log(f"[tool] screen_devices_for_system system_id={system_id} analyzed={len(all_results)} -> top_k={top_k}")
         return {"analyzed_devices": len(all_results), "top_devices": top}
+
+    def _tool_sql_query(
+        self, sql: str, params: List[Any] | None = None, named_params: Dict[str, Any] | None = None, max_rows: int = 200
+    ) -> Dict[str, Any]:
+        if not self.db_path:
+            return {
+                "error": "db_not_configured",
+                "message": "No SQLite DB is configured for this run; rerun with --db (or use --agent/--agent-only with --one-day-json to auto-ingest).",
+            }
+        bound: Any = ()
+        if named_params:
+            bound = dict(named_params)
+        elif params:
+            bound = list(params)
+        return sql_query_readonly(self.db_path, sql, bound, max_rows=int(max_rows))
+
+    def _tool_recommend_lookback(
+        self,
+        top_k: int,
+        thresholds: Dict[str, Any] | None = None,
+        candidate_days: List[int] | None = None,
+    ) -> Dict[str, Any]:
+        thr = thresholds if thresholds is not None else self._runtime_thresholds
+        return recommend_lookback(
+            self.datastore,
+            thresholds=thr,
+            top_k=int(top_k),
+            candidate_days=[int(x) for x in candidate_days] if candidate_days else None,
+        )
+
+    def _tool_series_summary(self, values: List[Dict[str, Any]]) -> Dict[str, Any]:
+        y = [float(v["v"]) for v in (values or [])]
+        if not y:
+            return {"n": 0}
+        n = len(y)
+        mean = sum(y) / n
+        var = sum((yi - mean) ** 2 for yi in y) / n
+        std = var ** 0.5
+        first = float(y[0])
+        last = float(y[-1])
+        delta = last - first
+        pct = (delta / first * 100.0) if first not in (0.0, -0.0) else None
+        return {
+            "n": int(n),
+            "first": first,
+            "last": last,
+            "delta": float(delta),
+            "pct_change": float(pct) if pct is not None else None,
+            "min": float(min(y)),
+            "max": float(max(y)),
+            "mean": float(mean),
+            "std": float(std),
+        }
+
+    def _tool_calc_slope(self, values: List[Dict[str, Any]]) -> Dict[str, Any]:
+        y = [float(v["v"]) for v in (values or [])]
+        return {"slope": float(linear_regression_slope(y))}
+
+    def _tool_calc_bootstrap_slope(
+        self,
+        values: List[Dict[str, Any]],
+        threshold: float,
+        iterations: int | None = None,
+        confidence: float | None = None,
+        seed: int | None = None,
+    ) -> Dict[str, Any]:
+        y = [float(v["v"]) for v in (values or [])]
+        it = int(iterations) if iterations is not None else int(self.config.bootstrap.iterations)
+        conf = float(confidence) if confidence is not None else float(self.config.bootstrap.confidence)
+        sd = int(seed) if seed is not None else int(self.config.bootstrap.seed)
+        bcfg = type(self.config.bootstrap)(
+            enabled=True,
+            iterations=it,
+            confidence=conf,
+            seed=sd,
+            downtrend_confidence_min=float(self.config.bootstrap.downtrend_confidence_min),
+        )
+        return {"bootstrap": bootstrap_slope(y, threshold=float(threshold), bootstrap=bcfg)}
+
+    def _tool_population_baseline(self, lookback_days: int, thresholds: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        thr = thresholds if thresholds is not None else self._runtime_thresholds
+        slopes: List[float] = []
+        drops: List[float] = []
+        unstable_ratios: List[float] = []
+        severities: List[int] = []
+        counts = {"downtrend": 0, "sudden": 0, "unstable": 0, "any": 0}
+
+        for system_id in self.datastore.list_system_ids():
+            ts = self.datastore.fetch_system_timeseries(system_id, int(lookback_days))
+            flags = flag_series(ts["values"], thr)
+            d = flags.get("downward", {}) or {}
+            sd = flags.get("sudden", {}) or {}
+            u = flags.get("unstable", {}) or {}
+            sev = (flags.get("severity", {}) or {}).get("severity", 0)
+
+            slope_point = float(d.get("slope_point", 0.0) or 0.0)
+            drop_amount = float(sd.get("drop_amount", 0.0) or 0.0)
+            unstable_ratio = float(u.get("unstable_ratio", 0.0) or 0.0)
+
+            slopes.append(slope_point)
+            drops.append(drop_amount)
+            unstable_ratios.append(unstable_ratio)
+            severities.append(int(sev or 0))
+
+            down_f = bool(d.get("flag"))
+            sud_f = bool(sd.get("flag"))
+            un_f = bool(u.get("flag"))
+            if down_f:
+                counts["downtrend"] += 1
+            if sud_f:
+                counts["sudden"] += 1
+            if un_f:
+                counts["unstable"] += 1
+            if down_f or sud_f or un_f:
+                counts["any"] += 1
+
+        def q(values: List[float], p: float) -> float:
+            if not values:
+                return 0.0
+            s = sorted(values)
+            idx = int((len(s) - 1) * p)
+            idx = max(0, min(idx, len(s) - 1))
+            return float(s[idx])
+
+        def qi(values: List[int], p: float) -> int:
+            if not values:
+                return 0
+            s = sorted(values)
+            idx = int((len(s) - 1) * p)
+            idx = max(0, min(idx, len(s) - 1))
+            return int(s[idx])
+
+        baseline = {
+            "lookback_days": int(lookback_days),
+            "n_systems": len(slopes),
+            "flag_counts": counts,
+            "quantiles": {
+                "slope_point": {"p05": q(slopes, 0.05), "p50": q(slopes, 0.50), "p95": q(slopes, 0.95)},
+                "drop_amount": {"p50": q(drops, 0.50), "p95": q(drops, 0.95)},
+                "unstable_ratio": {"p50": q(unstable_ratios, 0.50), "p95": q(unstable_ratios, 0.95)},
+                "severity": {"p50": qi(severities, 0.50), "p95": qi(severities, 0.95)},
+            },
+        }
+        self._population_baselines.append(baseline)
+        self._log(f"[tool] population_baseline lookback_days={lookback_days} n={baseline['n_systems']}")
+        return baseline
+
+    def _tool_system_context(
+        self, system_id: str, lookback_days: int, thresholds: Dict[str, Any] | None = None
+    ) -> Dict[str, Any]:
+        thr = thresholds if thresholds is not None else self._runtime_thresholds
+        ts = self.datastore.fetch_system_timeseries(system_id, int(lookback_days))
+        flags = flag_series(ts["values"], thr)
+
+        slopes: List[float] = []
+        drops: List[float] = []
+        unstable_ratios: List[float] = []
+        severities: List[int] = []
+        for sid in self.datastore.list_system_ids():
+            ts2 = self.datastore.fetch_system_timeseries(sid, int(lookback_days))
+            f2 = flag_series(ts2["values"], thr)
+            d2 = f2.get("downward", {}) or {}
+            sd2 = f2.get("sudden", {}) or {}
+            u2 = f2.get("unstable", {}) or {}
+            sev2 = (f2.get("severity", {}) or {}).get("severity", 0)
+            slopes.append(float(d2.get("slope_point", 0.0) or 0.0))
+            drops.append(float(sd2.get("drop_amount", 0.0) or 0.0))
+            unstable_ratios.append(float(u2.get("unstable_ratio", 0.0) or 0.0))
+            severities.append(int(sev2 or 0))
+
+        def pct_rank(values: List[float], x: float) -> float:
+            if not values:
+                return 0.0
+            s = sorted(values)
+            lo = 0
+            hi = len(s)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if s[mid] <= x:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            return float(lo / len(s))
+
+        def pct_rank_i(values: List[int], x: int) -> float:
+            if not values:
+                return 0.0
+            s = sorted(values)
+            lo = 0
+            hi = len(s)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if s[mid] <= x:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            return float(lo / len(s))
+
+        d = flags.get("downward", {}) or {}
+        sd = flags.get("sudden", {}) or {}
+        u = flags.get("unstable", {}) or {}
+        sev = int((flags.get("severity", {}) or {}).get("severity", 0) or 0)
+
+        context = {
+            "system_id": system_id,
+            "lookback_days": int(lookback_days),
+            "t": ts.get("t"),
+            "flags": flags,
+            "percentiles": {
+                "slope_point": pct_rank(slopes, float(d.get("slope_point", 0.0) or 0.0)),
+                "drop_amount": pct_rank(drops, float(sd.get("drop_amount", 0.0) or 0.0)),
+                "unstable_ratio": pct_rank(unstable_ratios, float(u.get("unstable_ratio", 0.0) or 0.0)),
+                "severity": pct_rank_i(severities, sev),
+            },
+        }
+        self._system_contexts[str(system_id)] = context
+        self._log(f"[tool] system_context system_id={system_id} lookback_days={lookback_days}")
+        return context

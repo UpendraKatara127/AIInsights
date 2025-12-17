@@ -9,6 +9,7 @@ description = "AI-Insights Agent (tool-calling) with bootstrap slope confidence"
 requires-python = ">=3.10"
 dependencies = [
   "openai>=1.40.0",
+  "truststore>=0.10.0",
 ]
 
 [project.optional-dependencies]
@@ -21,4 +22,3 @@ package-dir = {"" = "src"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-

@@ -43,7 +43,6 @@ This also writes a One_day_data.json-style file by default:
 
 ```bash
 python -m ai_insights_agent run \
-  --lookback 20 \
   --topk 5 \
   --model gpt-4.1-mini \
   --bootstrap-iterations 2000 \
@@ -51,13 +50,34 @@ python -m ai_insights_agent run \
   --downtrend-confidence-min 0.80
 ```
 
+Lookback:
+- Default is auto (chosen from the dataset).
+- Override explicitly with `--lookback 20`.
+
+## SQLite mode (recommended for scale)
+
+Ingest `One_day_data.json` into SQLite:
+
+```bash
+python -m ai_insights_agent ingest --one-day-json /path/to/One_day_data.json --db ./aiinsights.db
+```
+
+Run the agent against SQLite (read-only queries available to the model via `sql_query` tool):
+
+```bash
+python -m ai_insights_agent run --agent-only --db ./aiinsights.db --topk 10 --model gpt-4.1-mini
+```
+
 To run using `One_day_data.json` input:
 
 ```bash
 python -m ai_insights_agent run \
   --one-day-json /path/to/One_day_data.json \
-  --lookback 20 --topk 5 --model gpt-4.1-mini
+  --topk 5 --model gpt-4.1-mini
 ```
+
+Agent + SQLite note:
+- If you run `--agent` or `--agent-only` with `--one-day-json` and you do NOT pass `--db`, the tool will auto-ingest into `output/aiinsights_auto.db` so the agent can use `sql_query`.
 
 Note: `One_day_data.json` has no explicit dates. This repo treats each element in `data` as a daily entry (chronological)
 and synthesizes dates ending at today (so the latest value is at `t`). Override with `--one-day-end-date YYYY-MM-DD`.
